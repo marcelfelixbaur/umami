@@ -1,0 +1,78 @@
+name: Sync to latest Umami release
+
+# Tracks umami-software/umami *releases* (not master, which is their
+# development branch). On a new release this resets our master to the
+# release tag and force-pushes, which triggers a Vercel build. The build
+# runs scripts/check-db.js -> prisma migrate deploy, so schema changes
+# shipped with the release are applied automatically.
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-umami-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve latest upstream release tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh release view --repo umami-software/umami --json tagName --jq .tagName)
+          echo "Latest upstream release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Sync master to release tag
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -f .umami-release ] && [ "$(cat .umami-release)" = "$TAG" ]; then
+            echo "Already tracking $TAG - nothing to do."
+            exit 0
+          fi
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # Preserve this workflow across the hard reset below.
+          cp .github/workflows/sync-umami-release.yml "$RUNNER_TEMP/sync-umami-release.yml"
+
+          git remote add upstream https://github.com/umami-software/umami.git
+          git fetch upstream --tags --force
+
+          git reset --hard "refs/tags/$TAG"
+
+          # Upstream's CI/CD workflows are meaningless in a deployment fork
+          # and only produce failing runs and notification noise.
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/sync-umami-release.yml" .github/workflows/sync-umami-release.yml
+          printf '%s\n' "$TAG" > .umami-release
+
+          git add -A .github/workflows .umami-release
+
+          if git diff --cached --quiet; then
+            echo "Tree already matches $TAG."
+          else
+            git commit -m "chore: track upstream $TAG"
+          fi
+
+          git push --force origin HEAD:master
+
+          echo "Synced to $TAG. Vercel will build and apply pending migrations."
